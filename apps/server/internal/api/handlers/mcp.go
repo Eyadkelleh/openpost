@@ -2282,9 +2282,53 @@ func (h *MCPHandler) callTool(ctx context.Context, principal *middleware.Princip
 	result, auditToolName, auditArgs, rpcErr := h.executeMCPTool(ctx, principal.UserID, principal.Scope, canonicalName, params.Arguments)
 	if rpcErr == nil {
 		rpcErr = validateMCPResult(canonicalName, auditToolName, result)
+		if rpcErr == nil {
+			result = mcpAppendStructuredJSON(result)
+		}
 	}
 	h.recordToolCall(ctx, principal, auditToolName, workspaceIDFromMCPArguments(auditArgs), time.Since(start), rpcErr)
 	return result, rpcErr
+}
+
+// mcpAppendStructuredJSON keeps the human summary as content[0] and appends
+// the serialized structuredContent as an extra text block, per the MCP
+// 2025-06-18 guidance for clients that only surface text content.
+// structuredContent itself is left untouched. JSON-RPC error responses never
+// reach this helper. Successful tools already cap list sizes, so the extra
+// text block is not truncated.
+func mcpAppendStructuredJSON(result any) any {
+	m, ok := result.(map[string]any)
+	if !ok {
+		return result
+	}
+	sc, ok := m["structuredContent"]
+	if !ok || sc == nil {
+		return result
+	}
+	payload, err := json.Marshal(sc)
+	if err != nil {
+		return result
+	}
+	block := mcpContent{Type: "text", Text: string(payload)}
+	switch content := m["content"].(type) {
+	case []mcpContent:
+		out := make([]mcpContent, 0, len(content)+1)
+		out = append(out, content...)
+		m["content"] = append(out, block)
+	case []any:
+		out := make([]any, 0, len(content)+1)
+		out = append(out, content...)
+		m["content"] = append(out, block)
+	case []map[string]any:
+		out := make([]any, 0, len(content)+1)
+		for _, c := range content {
+			out = append(out, c)
+		}
+		m["content"] = append(out, block)
+	case nil:
+		m["content"] = []mcpContent{block}
+	}
+	return m
 }
 
 func mcpToolCallChangesState(canonicalName string) bool {
