@@ -1307,3 +1307,205 @@ func TestMCPCallAuditLogRecordsSuccessAndFailure(t *testing.T) {
 	require.Equal(t, "error", failure.Status)
 	require.Contains(t, failure.ErrorMessage, "outside this workspace")
 }
+
+func TestMCPAppendStructuredJSON(t *testing.T) {
+	t.Parallel()
+
+	t.Run("appends json text after the summary", func(t *testing.T) {
+		structured := map[string]any{
+			"media": []any{map[string]any{"id": "media-1", "filename": "launch.png"}},
+		}
+		original, err := json.Marshal(structured)
+		require.NoError(t, err)
+
+		result := mcpAppendStructuredJSON(map[string]any{
+			"content":           []mcpContent{{Type: "text", Text: "Found 1 media items."}},
+			"structuredContent": structured,
+		})
+
+		m := result.(map[string]any)
+		content := m["content"].([]mcpContent)
+		require.Len(t, content, 2)
+		require.Equal(t, "text", content[0].Type)
+		require.Equal(t, "Found 1 media items.", content[0].Text)
+		require.Equal(t, "text", content[1].Type)
+		require.JSONEq(t, string(original), content[1].Text)
+
+		after, err := json.Marshal(m["structuredContent"])
+		require.NoError(t, err)
+		require.Equal(t, original, after)
+	})
+
+	t.Run("leaves results without structuredContent unchanged", func(t *testing.T) {
+		input := map[string]any{
+			"content": []mcpContent{{Type: "text", Text: "No matching OpenPost operations found."}},
+		}
+		before, err := json.Marshal(input)
+		require.NoError(t, err)
+
+		result := mcpAppendStructuredJSON(input)
+
+		after, err := json.Marshal(result)
+		require.NoError(t, err)
+		require.JSONEq(t, string(before), string(after))
+		require.Len(t, result.(map[string]any)["content"].([]mcpContent), 1)
+	})
+
+	t.Run("leaves nil structuredContent unchanged", func(t *testing.T) {
+		input := map[string]any{
+			"content":           []mcpContent{{Type: "text", Text: "summary"}},
+			"structuredContent": nil,
+		}
+
+		result := mcpAppendStructuredJSON(input)
+
+		require.Len(t, result.(map[string]any)["content"].([]mcpContent), 1)
+		require.Nil(t, result.(map[string]any)["structuredContent"])
+	})
+
+	t.Run("leaves non-object results unchanged", func(t *testing.T) {
+		require.Equal(t, "plain", mcpAppendStructuredJSON("plain"))
+		require.Nil(t, mcpAppendStructuredJSON(nil))
+	})
+}
+
+func TestMCPCallListMediaIncludesStructuredJSONText(t *testing.T) {
+	t.Parallel()
+
+	srv := newMCPTestServer(t)
+	_, err := srv.db.NewInsert().Model(&models.MediaAttachment{
+		ID:               "media-launch",
+		WorkspaceID:      "ws-1",
+		FilePath:         "media-launch.png",
+		MimeType:         "image/png",
+		OriginalFilename: "launch.png",
+		Size:             2048,
+		CreatedAt:        time.Date(2026, 6, 30, 15, 0, 0, 0, time.UTC),
+	}).Exec(t.Context())
+	require.NoError(t, err)
+
+	resp := srv.request(t, "web-token", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "list-media-json-text",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": mcpToolQuery,
+			"arguments": map[string]any{
+				"operation": mcpToolListMedia,
+				"arguments": map[string]any{"workspace_id": "ws-1"},
+			},
+		},
+	})
+
+	require.Equal(t, http.StatusOK, resp.Code)
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &out))
+	require.NotContains(t, out, "error")
+	result := out["result"].(map[string]any)
+	requireMCPStructuredJSONText(t, result, "Found 1 media items.")
+
+	structured := result["structuredContent"].(map[string]any)
+	media := structured["media"].([]any)
+	require.Len(t, media, 1)
+	item := media[0].(map[string]any)
+	require.Equal(t, "media-launch", item["id"])
+	require.Equal(t, "launch.png", item["original_filename"])
+	require.Contains(t, mcpContentText(t, result, 1), "media-launch")
+	require.Contains(t, mcpContentText(t, result, 1), "launch.png")
+	example, err := json.MarshalIndent(map[string]any{"jsonrpc": out["jsonrpc"], "id": out["id"], "result": result}, "", "  ")
+	require.NoError(t, err)
+	t.Logf("tools/call example:\n%s", example)
+}
+
+func TestMCPCallSearchOperationsIncludesStructuredJSONText(t *testing.T) {
+	t.Parallel()
+
+	srv := newMCPTestServer(t)
+	resp := srv.request(t, "web-token", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "search-operations-json-text",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      mcpToolSearch,
+			"arguments": map[string]any{"query": "list media"},
+		},
+	})
+
+	require.Equal(t, http.StatusOK, resp.Code)
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &out))
+	require.NotContains(t, out, "error")
+	result := out["result"].(map[string]any)
+	summary := mcpContentText(t, result, 0)
+	require.Contains(t, summary, "OpenPost operation")
+	requireMCPStructuredJSONText(t, result, summary)
+
+	operations := result["structuredContent"].(map[string]any)["operations"].([]any)
+	require.NotEmpty(t, operations)
+	names := make([]string, 0, len(operations))
+	for _, item := range operations {
+		names = append(names, item.(map[string]any)["name"].(string))
+	}
+	require.Contains(t, names, mcpToolListMedia)
+	require.Contains(t, mcpContentText(t, result, 1), mcpToolListMedia)
+	require.Contains(t, mcpContentText(t, result, 1), "inputSchema")
+}
+
+func TestMCPCallErrorResponseOmitsStructuredJSONText(t *testing.T) {
+	t.Parallel()
+
+	srv := newMCPTestServer(t)
+	resp := srv.request(t, "web-token", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "error-no-json-text",
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      mcpToolQuery,
+			"arguments": map[string]any{"operation": "unknown_operation", "arguments": map[string]any{}},
+		},
+	})
+
+	require.Equal(t, http.StatusOK, resp.Code)
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &out))
+	require.Contains(t, out, "error")
+	require.NotContains(t, out, "result")
+	require.Contains(t, out["error"].(map[string]any)["message"], "unknown operation")
+}
+
+func requireMCPStructuredJSONText(t *testing.T, result map[string]any, summary string) {
+	t.Helper()
+
+	content, ok := result["content"].([]any)
+	require.True(t, ok)
+	require.Len(t, content, 2)
+
+	first := content[0].(map[string]any)
+	require.Equal(t, "text", first["type"])
+	require.Equal(t, summary, first["text"])
+
+	second := content[1].(map[string]any)
+	require.Equal(t, "text", second["type"])
+	jsonText, ok := second["text"].(string)
+	require.True(t, ok)
+	require.NotEmpty(t, jsonText)
+
+	structured := result["structuredContent"]
+	require.NotNil(t, structured)
+	expected, err := json.Marshal(structured)
+	require.NoError(t, err)
+	require.JSONEq(t, string(expected), jsonText)
+
+	var decoded any
+	require.NoError(t, json.Unmarshal([]byte(jsonText), &decoded))
+	roundTrip, err := json.Marshal(decoded)
+	require.NoError(t, err)
+	require.Equal(t, expected, roundTrip)
+}
+
+func mcpContentText(t *testing.T, result map[string]any, index int) string {
+	t.Helper()
+	content := result["content"].([]any)
+	require.Greater(t, len(content), index)
+	return content[index].(map[string]any)["text"].(string)
+}
