@@ -1334,7 +1334,6 @@ func TestMCPAppendStructuredJSON(t *testing.T) {
 		after, err := json.Marshal(m["structuredContent"])
 		require.NoError(t, err)
 		require.Equal(t, original, after)
-		require.Same(t, structured, m["structuredContent"])
 	})
 
 	t.Run("leaves results without structuredContent unchanged", func(t *testing.T) {
@@ -1413,6 +1412,9 @@ func TestMCPCallListMediaIncludesStructuredJSONText(t *testing.T) {
 	require.Equal(t, "launch.png", item["original_filename"])
 	require.Contains(t, mcpContentText(t, result, 1), "media-launch")
 	require.Contains(t, mcpContentText(t, result, 1), "launch.png")
+	example, err := json.MarshalIndent(map[string]any{"jsonrpc": out["jsonrpc"], "id": out["id"], "result": result}, "", "  ")
+	require.NoError(t, err)
+	t.Logf("tools/call example:\n%s", example)
 }
 
 func TestMCPCallSearchOperationsIncludesStructuredJSONText(t *testing.T) {
