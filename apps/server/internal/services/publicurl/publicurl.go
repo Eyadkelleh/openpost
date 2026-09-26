@@ -17,6 +17,24 @@ type Result struct {
 	CheckedAt  time.Time
 }
 
+// IsTransientFailure reports HTTP and network failures that often become
+// ready after delayed public-media sync, rather than configuration errors.
+func IsTransientFailure(result Result) bool {
+	if result.Ready {
+		return false
+	}
+	if result.Error == MediaURLConfigurationError || result.Error == legacyMediaURLError {
+		return false
+	}
+	switch result.StatusCode {
+	case http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return result.StatusCode == 0
+	}
+}
+
 type Verifier interface {
 	Verify(context.Context, string) Result
 }

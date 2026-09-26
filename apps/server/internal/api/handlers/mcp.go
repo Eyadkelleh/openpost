@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,51 +34,55 @@ import (
 	"github.com/openpost/backend/internal/services/providerreadiness"
 	"github.com/openpost/backend/internal/services/publicationauth"
 	publicationservice "github.com/openpost/backend/internal/services/publications"
+	"github.com/openpost/backend/internal/services/publicurl"
 	"github.com/openpost/backend/internal/services/usage"
 	"github.com/uptrace/bun"
 )
 
 const (
-	mcpProtocolVersion    = "2025-06-18"
-	mcpFallbackVersion    = "2025-03-26"
-	mcpToolSearch         = "search_operations"
-	mcpToolQuery          = "query_operation"
-	mcpToolExecute        = "execute_operation"
-	mcpLegacyToolSearch   = "search"
-	mcpLegacyToolQuery    = "query"
-	mcpLegacyToolExecute  = "execute"
-	mcpToolWorkspaces     = "list_workspaces"
-	mcpToolProviders      = "list_provider_catalog"
-	mcpToolAccounts       = "list_accounts"
-	mcpToolListMedia      = "list_media"
-	mcpToolReadiness      = "get_provider_readiness"
-	mcpToolCreatePub      = "create_publication"
-	mcpToolListPubs       = "list_publications"
-	mcpToolGetPub         = "get_publication"
-	mcpToolUpdatePub      = "update_publication"
-	mcpToolPubRenditions  = "set_publication_renditions"
-	mcpToolReplyRendition = "reply_to_rendition"
-	mcpToolValidatePub    = "validate_publication"
-	mcpToolSchedulePub    = "schedule_publication"
-	mcpToolCancelPub      = "cancel_publication"
-	mcpToolPublishPubNow  = "publish_publication_now"
-	mcpToolPubEvents      = "list_publication_events"
-	mcpToolComments       = "list_rendition_comments"
-	mcpToolReplyComment   = "reply_to_comment"
-	mcpToolHideComment    = "hide_comment"
-	mcpToolDeleteComment  = "delete_comment"
-	mcpToolSuggestSlot    = "suggest_next_slot"
-	mcpToolUploadURL      = "upload_media_from_url"
-	mcpToolRenderWidget   = "render_scheduler_widget"
-	mcpPromptPlanPost     = "plan_social_post"
-	mcpPromptRenditions   = "adapt_platform_renditions"
-	mcpPromptReviewQueue  = "review_schedule"
-	mcpScopeRead          = apitokens.ScopeMCPRead
-	mcpScopeFull          = apitokens.ScopeMCP
-	maxRemoteMediaBytes   = 50 * 1024 * 1024
-	maxMCPRequestBytes    = 2 * 1024 * 1024
-	mcpAppWidgetURI       = "ui://widget/openpost-scheduler-v1.html"
-	mcpAppWidgetMimeType  = "text/html;profile=mcp-app"
+	mcpProtocolVersion     = "2025-06-18"
+	mcpFallbackVersion     = "2025-03-26"
+	mcpToolSearch          = "search_operations"
+	mcpToolQuery           = "query_operation"
+	mcpToolExecute         = "execute_operation"
+	mcpLegacyToolSearch    = "search"
+	mcpLegacyToolQuery     = "query"
+	mcpLegacyToolExecute   = "execute"
+	mcpToolWorkspaces      = "list_workspaces"
+	mcpToolProviders       = "list_provider_catalog"
+	mcpToolAccounts        = "list_accounts"
+	mcpToolListMedia       = "list_media"
+	mcpToolReadiness       = "get_provider_readiness"
+	mcpToolCreatePub       = "create_publication"
+	mcpToolListPubs        = "list_publications"
+	mcpToolGetPub          = "get_publication"
+	mcpToolUpdatePub       = "update_publication"
+	mcpToolPubRenditions   = "set_publication_renditions"
+	mcpToolReplyRendition  = "reply_to_rendition"
+	mcpToolValidatePub     = "validate_publication"
+	mcpToolSchedulePub     = "schedule_publication"
+	mcpToolCancelPub       = "cancel_publication"
+	mcpToolPublishPubNow   = "publish_publication_now"
+	mcpToolPubEvents       = "list_publication_events"
+	mcpToolComments        = "list_rendition_comments"
+	mcpToolReplyComment    = "reply_to_comment"
+	mcpToolHideComment     = "hide_comment"
+	mcpToolDeleteComment   = "delete_comment"
+	mcpToolSuggestSlot     = "suggest_next_slot"
+	mcpToolUploadURL       = "upload_media_from_url"
+	mcpToolUploadBase64    = "upload_media_base64"
+	mcpToolRenderWidget    = "render_scheduler_widget"
+	mcpPromptPlanPost      = "plan_social_post"
+	mcpPromptRenditions    = "adapt_platform_renditions"
+	mcpPromptReviewQueue   = "review_schedule"
+	mcpScopeRead           = apitokens.ScopeMCPRead
+	mcpScopeFull           = apitokens.ScopeMCP
+	maxRemoteMediaBytes    = 50 * 1024 * 1024
+	maxMCPRequestBytes     = 12 * 1024 * 1024
+	maxMCPBase64MediaBytes = 8 * 1024 * 1024
+	mcpBase64MediaSizeMiB  = maxMCPBase64MediaBytes >> 20
+	mcpAppWidgetURI        = "ui://widget/openpost-scheduler-v1.html"
+	mcpAppWidgetMimeType   = "text/html;profile=mcp-app"
 )
 
 type MCPHandler struct {
@@ -88,6 +93,7 @@ type MCPHandler struct {
 	mediaStorage      mediastore.BlobStorage
 	mediaURLHTTP      *http.Client
 	mediaURLValidator func(context.Context, *url.URL) error
+	publicMedia       *publicurl.MediaVerifier
 	publicURL         string
 	allowedOrigins    map[string]bool
 	providers         map[string]platform.Adapter
@@ -124,6 +130,10 @@ func (h *MCPHandler) SetServerVersion(version string) {
 
 func (h *MCPHandler) SetMediaStorage(storage mediastore.BlobStorage) {
 	h.mediaStorage = storage
+}
+
+func (h *MCPHandler) SetPublicMediaVerifier(verifier *publicurl.MediaVerifier) {
+	h.publicMedia = verifier
 }
 
 func (h *MCPHandler) SetPublicURL(publicURL string) {
@@ -168,7 +178,18 @@ func (h *MCPHandler) publicationHandler() *PublicationHandler {
 	handler.providers = h.providers
 	handler.tokenSource = h.tokenSource
 	handler.readiness = h.readiness
+	handler.SetPublicMediaVerifier(h.publicMedia)
 	return handler
+}
+
+func (h *MCPHandler) mediaHandler() *MediaHandler {
+	return &MediaHandler{
+		db:          h.db,
+		storage:     h.mediaStorage,
+		quota:       h.entitlement,
+		usage:       h.usage,
+		publicMedia: h.publicMedia,
+	}
 }
 
 func (h *MCPHandler) RegisterRoutes(e *echo.Echo) {
@@ -873,10 +894,10 @@ Source idea:
 %s
 
 Workflow:
-1. Call search_operations to load the schemas for list_workspaces, list_provider_catalog, list_accounts, list_media, upload_media_from_url, and create_publication as needed.
+1. Call search_operations to load the schemas for list_workspaces, list_provider_catalog, list_accounts, list_media, upload_media_from_url, upload_media_base64, and create_publication as needed.
 2. If workspace_id is missing, call query_operation with list_workspaces and ask which workspace to use.
 3. Call query_operation with list_provider_catalog and list_accounts to choose available destinations matching these platform hints: %s.
-4. Call query_operation with list_media if the idea needs existing media, or call execute_operation with upload_media_from_url if the user supplied a public media URL.
+4. Call query_operation with list_media if the idea needs existing media. Call execute_operation with upload_media_base64 for a local file, or upload_media_from_url if the user supplied a public media URL.
 5. Call execute_operation with create_publication to create one concise draft and relevant media_ids. Do not schedule it until the user approves timing and destinations.
 6. Explain what you created and suggest the next scheduling step.
 
@@ -987,6 +1008,7 @@ func mcpOperationCatalog() []mcpOperationDefinition {
 		mcpDeleteCommentTool(),
 		mcpSuggestNextSlotTool(),
 		mcpUploadMediaFromURLTool(),
+		mcpUploadMediaBase64Tool(),
 	}
 }
 
@@ -1333,7 +1355,7 @@ func mcpCreatePublicationTool() mcpOperationDefinition {
 	mediaSchema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"media_id":               map[string]any{"type": "string", "description": "Media attachment ID returned by list_media or upload_media_from_url."},
+			"media_id":               map[string]any{"type": "string", "description": "Media attachment ID returned by list_media, upload_media_from_url, or upload_media_base64."},
 			"role":                   map[string]any{"type": "string", "description": "Media role such as attachment, cover, or thumbnail."},
 			"alt_text":               map[string]any{"type": "string", "description": "Alt text override."},
 			"thumbnail_timestamp_ms": map[string]any{"type": "integer", "description": "Video thumbnail timestamp in milliseconds."},
@@ -1548,7 +1570,7 @@ func mcpPublicationIDSchema() map[string]any {
 func mcpPublicationMediaSchema() map[string]any {
 	return map[string]any{
 		"type": "object", "properties": map[string]any{
-			"media_id": map[string]any{"type": "string", "description": "Media attachment ID returned by list_media or upload_media_from_url."},
+			"media_id": map[string]any{"type": "string", "description": "Media attachment ID returned by list_media, upload_media_from_url, or upload_media_base64."},
 			"role": map[string]any{
 				"type": "string", "enum": []string{"attachment", "cover", "thumbnail"},
 				"description": "Media purpose within the provider output.",
@@ -1775,6 +1797,41 @@ func mcpUploadMediaFromURLTool() mcpOperationDefinition {
 	}, mcpOperationExecute, false, true)
 }
 
+func mcpUploadMediaBase64Tool() mcpOperationDefinition {
+	return mcpOperationDescriptor(map[string]any{
+		"name":        mcpToolUploadBase64,
+		"title":       "Upload media from base64",
+		"description": "Upload a local image, video, or PDF from decoded file bytes when the client cannot render a file picker and the file is not at a public URL. Send content_base64 (standard base64 of the raw file, optionally a data: URL). Decoded files must be " + fmt.Sprintf("%d MiB", mcpBase64MediaSizeMiB) + " or smaller. Returns the stored media ID, file metadata, processing state, and URLs.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"workspace_id": map[string]any{
+					"type":        "string",
+					"description": "Workspace ID returned by list_workspaces.",
+				},
+				"filename": map[string]any{
+					"type":        "string",
+					"description": "Filename to store for display and extension detection, such as flyer.png.",
+				},
+				"mime_type": map[string]any{
+					"type":        "string",
+					"description": "Optional MIME type. When omitted, OpenPost sniffs the decoded bytes. When provided, it must match the file contents.",
+				},
+				"content_base64": map[string]any{
+					"type":        "string",
+					"description": "Standard base64 encoding of the raw file bytes. A data: URL prefix is accepted and stripped.",
+				},
+				"alt_text": map[string]any{
+					"type":        "string",
+					"description": "Optional accessible alt text for the media.",
+				},
+			},
+			"required":             []string{"workspace_id", "filename", "content_base64"},
+			"additionalProperties": false,
+		},
+	}, mcpOperationExecute, false, true)
+}
+
 func mcpRenderSchedulerWidgetTool() map[string]any {
 	return mcpToolDescriptor(map[string]any{
 		"name":        mcpToolRenderWidget,
@@ -1915,6 +1972,7 @@ var mcpToolStatuses = map[string]mcpToolStatus{
 	mcpToolDeleteComment:  {Invoking: "Queueing comment deletion", Invoked: "Comment deletion queued"},
 	mcpToolSuggestSlot:    {Invoking: "Finding next slot", Invoked: "Next slot found"},
 	mcpToolUploadURL:      {Invoking: "Uploading media", Invoked: "Media uploaded"},
+	mcpToolUploadBase64:   {Invoking: "Uploading media", Invoked: "Media uploaded"},
 	mcpToolRenderWidget:   {Invoking: "Rendering view", Invoked: "View rendered"},
 }
 
@@ -1954,7 +2012,7 @@ func mcpToolOutputSchema(toolName string) map[string]any {
 		return mcpStructuredOutputSchema(map[string]any{
 			"suggestion": mcpOpenObjectSchema(),
 		}, "suggestion")
-	case mcpToolUploadURL:
+	case mcpToolUploadURL, mcpToolUploadBase64:
 		return mcpStructuredOutputSchema(map[string]any{
 			"media": mcpOpenObjectSchema(),
 		}, "media")
@@ -2572,7 +2630,7 @@ func (h *MCPHandler) callMCPOperation(ctx context.Context, userID, operation str
 		return h.renderSchedulerWidget(args)
 	case mcpToolCreatePub, mcpToolListPubs, mcpToolGetPub, mcpToolUpdatePub, mcpToolPubRenditions, mcpToolReplyRendition,
 		mcpToolValidatePub, mcpToolSchedulePub, mcpToolCancelPub, mcpToolPublishPubNow, mcpToolPubEvents, mcpToolComments,
-		mcpToolReplyComment, mcpToolHideComment, mcpToolDeleteComment, mcpToolSuggestSlot, mcpToolUploadURL:
+		mcpToolReplyComment, mcpToolHideComment, mcpToolDeleteComment, mcpToolSuggestSlot, mcpToolUploadURL, mcpToolUploadBase64:
 		return h.callWorkspaceActionTool(ctx, userID, operation, args)
 	default:
 		return nil, &mcpError{Code: -32602, Message: fmt.Sprintf("unknown operation %q; call %s to discover supported operations", operation, mcpToolSearch)}
@@ -2589,6 +2647,8 @@ func (h *MCPHandler) callWorkspaceActionTool(ctx context.Context, userID, toolNa
 		return h.suggestNextSlot(ctx, userID, args)
 	case mcpToolUploadURL:
 		return h.uploadMediaFromURL(ctx, userID, args)
+	case mcpToolUploadBase64:
+		return h.uploadMediaBase64(ctx, userID, args)
 	default:
 		return nil, &mcpError{Code: -32602, Message: "unknown tool"}
 	}
@@ -3791,14 +3851,17 @@ func (h *MCPHandler) listMedia(ctx context.Context, userID string, args map[stri
 	if err != nil && err != sql.ErrNoRows {
 		return nil, &mcpError{Code: -32603, Message: "failed to list media"}
 	}
-	mediaHandler := &MediaHandler{db: h.db}
+	mediaHandler := h.mediaHandler()
 	media := make([]mcpMedia, 0, len(rows))
-	for _, row := range rows {
-		usage, err := mediaHandler.mediaUsageSummary(ctx, row.WorkspaceID, row.ID)
+	for index := range rows {
+		if err := refreshPublicMediaState(ctx, h.db, h.publicMedia, &rows[index]); err != nil {
+			log.Printf("failed to refresh public URL verification for media %s: %v", rows[index].ID, err)
+		}
+		usage, err := mediaHandler.mediaUsageSummary(ctx, rows[index].WorkspaceID, rows[index].ID)
 		if err != nil {
 			return nil, &mcpError{Code: -32603, Message: "failed to check media usage"}
 		}
-		media = append(media, mcpMediaFromAttachment(row, usage.Total, usage.Blocking == 0))
+		media = append(media, mcpMediaFromAttachment(rows[index], usage.Total, usage.Blocking == 0))
 	}
 
 	text := fmt.Sprintf("Found %d media items.", len(media))
@@ -3913,13 +3976,7 @@ func (h *MCPHandler) uploadMediaFromURL(ctx context.Context, userID string, args
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	mediaHandler := &MediaHandler{
-		db:      h.db,
-		storage: h.mediaStorage,
-		quota:   h.entitlement,
-		usage:   h.usage,
-	}
-	result, err := mediaHandler.processUploadBytes(ctx, mediaUploadBytesInput{
+	result, err := h.mediaHandler().processUploadBytes(ctx, mediaUploadBytesInput{
 		WorkspaceID:      input.WorkspaceID,
 		Filename:         filename,
 		DeclaredMimeType: declaredMimeType,
@@ -3930,17 +3987,65 @@ func (h *MCPHandler) uploadMediaFromURL(ctx context.Context, userID string, args
 	if err != nil {
 		return nil, &mcpError{Code: -32602, Message: err.Error()}
 	}
+	return h.mcpUploadedMediaResult(ctx, stringFromMap(result, "id"), filename, input.AltText, remote.String(), boolFromMap(result, "deduped"))
+}
 
-	media := mcpMedia{
-		ID:        stringFromMap(result, "id"),
-		MimeType:  stringFromMap(result, "mime_type"),
-		URL:       stringFromMap(result, "url"),
-		Size:      int64FromMap(result, "size"),
-		Deduped:   boolFromMap(result, "deduped"),
-		Filename:  filename,
-		AltText:   input.AltText,
-		SourceURL: remote.String(),
+func (h *MCPHandler) uploadMediaBase64(ctx context.Context, userID string, args map[string]any) (any, *mcpError) {
+	var input struct {
+		WorkspaceID   string `json:"workspace_id"`
+		Filename      string `json:"filename"`
+		MimeType      string `json:"mime_type"`
+		ContentBase64 string `json:"content_base64"`
+		AltText       string `json:"alt_text"`
 	}
+	if err := decodeMCPArguments(args, &input); err != nil {
+		return nil, &mcpError{Code: -32602, Message: "invalid upload_media_base64 arguments"}
+	}
+	if rpcErr := h.ensureWorkspaceEditAccess(ctx, userID, input.WorkspaceID); rpcErr != nil {
+		return nil, rpcErr
+	}
+	if h.mediaStorage == nil {
+		return nil, &mcpError{Code: -32603, Message: "media storage is not configured"}
+	}
+
+	content, rpcErr := decodeMCPBase64Media(input.ContentBase64)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	filename := cleanRemoteMediaFilename(input.Filename)
+	if filename == "" || filename == "." || filename == "/" {
+		return nil, &mcpError{Code: -32602, Message: "filename is required"}
+	}
+	declaredMimeType, rpcErr := resolveMCPUploadMIME(filename, input.MimeType, http.DetectContentType(content))
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	result, err := h.mediaHandler().processUploadBytes(ctx, mediaUploadBytesInput{
+		WorkspaceID:      input.WorkspaceID,
+		Filename:         filename,
+		DeclaredMimeType: declaredMimeType,
+		Size:             int64(len(content)),
+		Content:          content,
+		AltText:          input.AltText,
+	})
+	if err != nil {
+		return nil, &mcpError{Code: -32602, Message: err.Error()}
+	}
+	return h.mcpUploadedMediaResult(ctx, stringFromMap(result, "id"), filename, input.AltText, "", boolFromMap(result, "deduped"))
+}
+
+func (h *MCPHandler) mcpUploadedMediaResult(ctx context.Context, mediaID, filename, altText, sourceURL string, deduped bool) (any, *mcpError) {
+	var stored models.MediaAttachment
+	if err := h.db.NewSelect().Model(&stored).Where("id = ?", mediaID).Scan(ctx); err != nil {
+		return nil, &mcpError{Code: -32603, Message: "failed to load uploaded media"}
+	}
+	media := mcpMediaFromAttachment(stored, 0, true)
+	media.Filename = filename
+	if altText != "" {
+		media.AltText = altText
+	}
+	media.SourceURL = sourceURL
+	media.Deduped = deduped
 	return map[string]any{
 		"content": []mcpContent{{
 			Type: "text",
@@ -3950,6 +4055,109 @@ func (h *MCPHandler) uploadMediaFromURL(ctx context.Context, userID string, args
 			"media": media,
 		},
 	}, nil
+}
+
+func decodeMCPBase64Media(raw string) ([]byte, *mcpError) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, &mcpError{Code: -32602, Message: "content_base64 is required"}
+	}
+	if strings.HasPrefix(strings.ToLower(raw), "data:") {
+		if comma := strings.Index(raw, ","); comma >= 0 {
+			raw = raw[comma+1:]
+		}
+	}
+	raw = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t', ' ':
+			return -1
+		default:
+			return r
+		}
+	}, raw)
+	content, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		content, err = base64.RawStdEncoding.DecodeString(raw)
+	}
+	if err != nil {
+		return nil, &mcpError{Code: -32602, Message: "content_base64 is not valid base64"}
+	}
+	if len(content) == 0 {
+		return nil, &mcpError{Code: -32602, Message: "decoded media is empty"}
+	}
+	if len(content) > maxMCPBase64MediaBytes {
+		return nil, &mcpError{Code: -32602, Message: fmt.Sprintf(
+			"decoded media exceeds the %d MiB MCP base64 limit; use a smaller file or host it at a public URL and call upload_media_from_url",
+			mcpBase64MediaSizeMiB,
+		)}
+	}
+	return content, nil
+}
+
+func resolveMCPUploadMIME(filename, declared, sniffed string) (string, *mcpError) {
+	sniffed = normalizeMCPMediaMIME(sniffed)
+	declared = normalizeMCPMediaMIME(declared)
+	if sniffed == "" || sniffed == defaultMediaMimeType {
+		if inferred := mimeFromUploadFilename(filename); inferred != "" {
+			sniffed = inferred
+		}
+	}
+	if declared != "" && sniffed != "" && sniffed != defaultMediaMimeType && declared != sniffed {
+		return "", &mcpError{Code: -32602, Message: fmt.Sprintf("mime_type %s does not match file contents (%s)", declared, sniffed)}
+	}
+	candidate := declared
+	if candidate == "" {
+		candidate = sniffed
+	}
+	if !mcpMediaMIMEAllowed(candidate) {
+		if candidate == "" {
+			candidate = "unknown"
+		}
+		return "", &mcpError{Code: -32602, Message: fmt.Sprintf("unsupported mime type %s; upload jpeg, png, gif, webp, mp4, mov, webm, or pdf", candidate)}
+	}
+	return candidate, nil
+}
+
+func normalizeMCPMediaMIME(value string) string {
+	value = strings.ToLower(strings.TrimSpace(strings.Split(value, ";")[0]))
+	if value == "image/jpg" {
+		return "image/jpeg"
+	}
+	return value
+}
+
+func mcpMediaMIMEAllowed(mimeType string) bool {
+	switch normalizeMCPMediaMIME(mimeType) {
+	case "image/jpeg", "image/png", "image/gif", "image/webp",
+		"video/mp4", "video/quicktime", "video/webm",
+		"application/pdf":
+		return true
+	default:
+		return false
+	}
+}
+
+func mimeFromUploadFilename(filename string) string {
+	switch strings.ToLower(path.Ext(strings.TrimSpace(filename))) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".webm":
+		return "video/webm"
+	case ".pdf":
+		return "application/pdf"
+	default:
+		return ""
+	}
 }
 
 func (h *MCPHandler) fetchRemoteMedia(ctx context.Context, rawURL, requestedFilename string) (*url.URL, string, string, []byte, *mcpError) {

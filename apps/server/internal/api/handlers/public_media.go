@@ -17,7 +17,33 @@ func refreshPublicMediaState(
 	if verifier == nil || media == nil || !verifier.NeedsRefresh(*media) {
 		return nil
 	}
+	return persistPublicMediaResult(ctx, db, media, verifier.Verify(ctx, *media))
+}
+
+func refreshPublicMediaStateAfterUpload(
+	ctx context.Context,
+	db bun.IDB,
+	verifier *publicurl.MediaVerifier,
+	media *models.MediaAttachment,
+) error {
+	if verifier == nil || media == nil {
+		return nil
+	}
 	result := verifier.Verify(ctx, *media)
+	if publicurl.IsTransientFailure(result) {
+		// The public /media copy may still be syncing. Record pending so an
+		// immediate 404 is not stored as a lasting failure.
+		result = publicurl.Result{CheckedAt: result.CheckedAt}
+	}
+	return persistPublicMediaResult(ctx, db, media, result)
+}
+
+func persistPublicMediaResult(
+	ctx context.Context,
+	db bun.IDB,
+	media *models.MediaAttachment,
+	result publicurl.Result,
+) error {
 	applyPublicMediaResult(media, result)
 	if db == nil || media.ID == "" {
 		return nil
