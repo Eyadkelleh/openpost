@@ -191,6 +191,7 @@ boundary.
 - `delete_comment`: permanently deletes a supported provider comment.
 - `suggest_next_slot`: returns the next free configured posting slot for a workspace.
 - `upload_media_from_url`: fetches a public HTTP(S) media URL and stores it in a workspace.
+- `upload_media_base64`: stores a local file from standard base64 when the client cannot render a file picker. Decoded files must be 8 MiB or smaller; the MCP request body limit is 12 MiB to leave room for base64 and the JSON-RPC envelope. Larger files should use `upload_media_from_url`.
 
 The directly advertised `render_scheduler_widget` is intentionally outside the
 delegated operation catalog; clients call it only when they want the Apps UI.
@@ -241,6 +242,7 @@ This policy follows the [Official MCP Registry versioning guidance](https://mode
 - Keeps draft iteration agent-friendly: assistants can create, list, update, validate, schedule, cancel, and publish Publications through the canonical Publication tools, set per-destination renditions through `set_publication_renditions`, and inspect lifecycle events.
 - Validates rendition targets against the Publication destination list so assistants do not create outputs that would never publish.
 - Rejects media URL fetches that resolve to private, loopback, link-local, multicast, or otherwise local addresses.
+- Accepts local file bytes through `upload_media_base64` when a public URL is not available, with an 8 MiB decoded size limit and a 12 MiB MCP request body.
 - Enforces the same scheduled-publication and media-upload entitlement and usage accounting as the web/API paths.
 - Records MCP tool calls in `mcp_tool_calls` with user, workspace, tool name, success/error status, error message, duration, and timestamp, and exposes recent calls in settings.
 - Records API-token client ID, name, scope, and token prefix for MCP tool calls when a request uses a dedicated CLI/MCP token, so Settings can attribute activity to ChatGPT, Claude, CI, or another configured client.

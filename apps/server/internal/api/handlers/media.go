@@ -3159,7 +3159,7 @@ func (h *MediaHandler) processStreamUpload(
 		}
 		return nil, errors.New("failed to save stock media provenance")
 	}
-	if err := refreshPublicMediaState(ctx, h.db, h.publicMedia, media); err != nil {
+	if err := refreshPublicMediaStateAfterUpload(ctx, h.db, h.publicMedia, media); err != nil {
 		log.Printf("failed to persist public URL verification for media %s: %v", media.ID, err)
 	}
 	if strings.HasPrefix(mimeType, "video/") && h.video != nil {
@@ -3330,7 +3330,7 @@ func (h *MediaHandler) processUploadBytes(ctx context.Context, input mediaUpload
 		}
 		return nil, errors.New("failed to save stock media provenance")
 	}
-	if err := refreshPublicMediaState(ctx, h.db, h.publicMedia, media); err != nil {
+	if err := refreshPublicMediaStateAfterUpload(ctx, h.db, h.publicMedia, media); err != nil {
 		log.Printf("failed to persist public URL verification for media %s: %v", media.ID, err)
 	}
 	if strings.HasPrefix(mimeType, "video/") {
